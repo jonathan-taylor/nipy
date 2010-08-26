@@ -121,10 +121,13 @@ def run_model(subj):
     # XXX smooth here?
     # ar1 = smooth(ar1, 8.0)
 
+    nanmask = np.isnan(ar1)
     ar1 *= 100
     ar1 = ar1.astype(np.int) / 100.
     ar1 = np.clip(ar1, -1, 1)
-
+    NANVAL = -3.45
+    ar1[nanmask] = NANVAL
+    
     # Setup a dictionary to hold all the output
     # XXX ideally these would be memmap'ed Image instances
 
@@ -132,15 +135,17 @@ def run_model(subj):
     for n in cons:
         tempdict = {}
         for v in ['sd', 't', 'effect']:
-            tempdict[v] = np.memmap(NamedTemporaryFile(prefix='%s%s.nii' \
+            tempdict[v] = np.memmap(NamedTemporaryFile(prefix='%s%s.npy' \
                                                        % (n,v)), dtype=np.float, 
                                     shape=volshape, mode='w+')
         output[n] = tempdict
     
     # Loop over the unique values of ar1
 
+    pbar = ProgressBar(maxval=np.product(volshape) - nanmask.sum())
+    voxels_fit = 0
     for val in np.unique(ar1):
-        if val != -1.:
+        if val != NANVAL:
             armask = np.equal(ar1, val)
             m = ARModel(X, val)
             d = fmri[:,armask]
@@ -154,6 +159,14 @@ def run_model(subj):
                 output[n]['t'][armask] = resT.t
                 output[n]['effect'][armask] = resT.effect
 
+            voxels_fit += armask.sum()
+            pbar.update(voxels_fit)
+        else:
+            for n in cons:
+                output[n]['sd'][nanmask] = np.nan
+                output[n]['t'][nanmask] = np.nan
+                output[n]['effect'][nanmask] = np.nan
+            
     # Dump output to disk
     odir = pjoin(shop_util.DATADIR, 'results', subj)
     coordmap = drop_io_dim(fmri_im.coordmap, 't')
@@ -171,8 +184,8 @@ def fixed_effects(contrast):
     Fixed effects for SHOP data
     """
 
-    # First, find all the effect and standard deviation images
-    # for the subject and this design type
+    # First, find the effect and standard deviation images
+    # for this contrast
 
     subjects = glob(pjoin(shop_util.DATADIR, 'results', '*', contrast))
     
@@ -208,26 +221,29 @@ def fixed_effects(contrast):
 
     # Save the results
     odir = shop_util.ensure_dir(fixdir, contrast)
+
     for a, n in zip([fixed_effect, fixed_sd, fixed_t],
                     ['effect', 'sd', 't']):
         old = coordmap.affine
         im = Image(a, coordmap)
         save_image(im, pjoin(odir, '%s.nii' % n))
         
-def group_analysis(design, contrast):
+MASK = load_image(pjoin(shop_util.DATADIR, 'fixed_results', 'mask.nii'))
+
+def group_analysis(contrast):
     """
     Compute group analysis effect, sd and t
-    for a given contrast and design type
+    for a given contrast
     """
     array = np.array # shorthand
     # Directory where output will be written
-    odir = futil.ensure_dir(futil.DATADIR, 'group', design, contrast)
+    odir = shop_util.ensure_dir(pjoin(pjoin(shop_util.DATADIR, 'group_results', contrast)))
 
-    # Which subjects have this (contrast, design) pair?
-    subjects = futil.subject_dirs(design, contrast)
+    # Which subjects have this contrast
+    subjects = glob(pjoin(shop_util.DATADIR, 'results', '*', contrast))
 
-    sd = array([array(load_image(pjoin(s, "sd.nii"))) for s in subjects])
-    Y = array([array(load_image(pjoin(s, "effect.nii"))) for s in subjects])
+    sd = array([load_image(pjoin(s, "sd.nii")).get_data() for s in subjects])
+    Y = array([load_image(pjoin(s, "effect.nii")).get_data() for s in subjects])
 
     # This function estimates the ratio of the
     # fixed effects variance (sum(1/sd**2, 0))
@@ -252,19 +268,19 @@ def group_analysis(design, contrast):
     # estimate of the effect and its variance is
     # computed and saved.
 
-    # This is the coordmap we will use
-    coordmap = futil.load_image_fiac("fiac_00","wanatomical.nii").coordmap
+    # Get our hands on the relevant coordmap to
+    # save our results
+    coordmap = load_image(pjoin(subjects[0], 'effect.nii')).coordmap
 
     adjusted_var = sd**2 + random_var
     adjusted_sd = np.sqrt(adjusted_var)
 
     results = onesample.estimate_mean(Y, adjusted_sd) 
     for n in ['effect', 'sd', 't']:
-        im = api.Image(results[n], coordmap.copy())
+        im = api.Image(results[n], coordmap)
         save_image(im, pjoin(odir, "%s.nii" % n))
 
-
-def group_analysis_signs(design, contrast, mask, signs=None):
+def group_analysis_signs(contrast, mask, signs=None):
     """
     This function refits the EM model with a vector of signs.
     Used in the permutation tests.
@@ -273,8 +289,6 @@ def group_analysis_signs(design, contrast, mask, signs=None):
 
     Parameters
     ----------
-
-    design: one of 'block', 'event'
 
     contrast: str
 
@@ -295,16 +309,30 @@ def group_analysis_signs(design, contrast, mask, signs=None):
     
     """
 
-    maska = np.asarray(mask).astype(np.bool)
+    array = np.array # shorthand
+    # Directory where output will be written
+    odir = pjoin(pjoin(shop_util.DATADIR, 'group_results', contrast))
 
-    # Which subjects have this (contrast, design) pair?
+    # Which subjects have this contrast?
+    subjects = glob(pjoin(shop_util.DATADIR, 'results', '*', contrast))
 
-    subjects = futil.subject_dirs(design, contrast)
+    sd = array([load_image(pjoin(s, "sd.nii")).get_data() for s in subjects])
+    sd = sd.reshape((sd.shape[0], -1))
 
-    sd = np.array([np.array(load_image(pjoin(s, "sd.nii")))[:,maska]
-                   for s in subjects])
-    Y = np.array([np.array(load_image(pjoin(s, "effect.nii")))[:,maska]
-                  for s in subjects])
+    Y = array([load_image(pjoin(s, "effect.nii")).get_data() for s in subjects])
+    Y = Y.reshape((Y.shape[0], -1))
+
+    # This function estimates the ratio of the
+    # fixed effects variance (sum(1/sd**2, 0))
+    # to the estimated random effects variance
+    # (sum(1/(sd+rvar)**2, 0)) where
+    # rvar is the random effects variance.
+
+    # The EM algorithm used is described in 
+    #
+    # Worsley, K.J., Liao, C., Aston, J., Petre, V., Duncan, G.H., 
+    #    Morales, F., Evans, A.C. (2002). \'A general statistical 
+    #    analysis for fMRI data\'. NeuroImage, 15:1-15
 
     if signs is None:
         signs = np.ones((1, Y.shape[0]))
@@ -326,7 +354,7 @@ def group_analysis_signs(design, contrast, mask, signs=None):
     return minT, maxT
 
 
-def permutation_test(design, contrast, mask=GROUP_MASK,
+def permutation_test(contrast, mask=GROUP_MASK,
                      nsample=1000):
     """
     Perform a permutation (sign) test for a given design type and
@@ -335,8 +363,6 @@ def permutation_test(design, contrast, mask=GROUP_MASK,
 
     Parameters
     ----------
-
-    design: one of ['block', 'event']
 
     contrast: str
 

@@ -10,7 +10,7 @@ import numpy as np
 
 from enthought.mayavi import mlab
 
-from fiac_util import load_image_fiac
+from shop_util import load_image_fiac
 
 #-----------------------------------------------------------------------------
 # Globals
