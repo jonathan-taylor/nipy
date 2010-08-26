@@ -334,7 +334,7 @@ def events(times, amplitudes=None, f=DiracDelta, g=Symbol('a')):
     return e
 
 
-def blocks(intervals, amplitudes=None):
+def blocks(intervals, amplitudes=None, name=None):
     """ Step function based on a sequence of intervals.
 
     Parameters
@@ -344,6 +344,10 @@ def blocks(intervals, amplitudes=None):
        sequences of length 2, giving 'on' and 'off' times of block
     amplitudes : (S,) sequence of float, optional
        Optional amplitudes for each block. Defaults to 1.
+    name : None or str, optional
+       Name of the convolved function in the resulting expression. 
+       Defaults to one created by ``utils.interp``.
+            
 
     Returns
     -------
@@ -373,7 +377,7 @@ def blocks(intervals, amplitudes=None):
         v += [a, 0]
     t.append(np.inf)
     v.append(0)
-    return step_function(t, v)
+    return step_function(t, v, name=name)
 
 
 def convolve_functions(fn1, fn2, interval, dt, padding_f=0.1, name=None):
@@ -439,6 +443,8 @@ def convolve_functions(fn1, fn2, interval, dt, padding_f=0.1, name=None):
     # - so he peak value is 1-dt - rather than 1 - but we get the same
     # result from using np.convolve - see tests.
     mn_i, mx_i = sorted(interval)
+    # XXX interval is not being used correctly
+    # BUG: if mn_i != 0, there is an incorrect shift
     pad_t = (mx_i - mn_i) * padding_f
     time = np.arange(mn_i, mx_i + pad_t, dt)
     # get values at times from expressions
