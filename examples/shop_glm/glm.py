@@ -9,31 +9,35 @@
 # Stdlib
 import warnings
 from tempfile import NamedTemporaryFile
-from os.path import join as pjoin
+from os.path import join as pjoin, exists as pexists
+from os import makedirs
+from glob import glob
 
 # Third party
 import numpy as np
+from progressbar import ProgressBar
 
 # From NIPY
 from nipy.fixes.scipy.stats.models.regression import (OLSModel, ARModel,
                                                       isestimable )
-from nipy.modalities.fmri.fmristat import hrf as delay
 from nipy.modalities.fmri import formula, design, hrf
 from nipy.io.api import load_image, save_image
 from nipy.core import api
 from nipy.core.image.image import rollaxis as image_rollaxis
-
+from nipy.core.reference.coordinate_map import drop_io_dim
+from nipy.core.api import Image
 from nipy.algorithms.statistics import onesample 
 
 # Local
-import fiac_util as futil
-reload(futil)  # while developing interactively
+import util as shop_util
+import subject as shop_subj
+reload(shop_util)  # while developing interactively
 
 #-----------------------------------------------------------------------------
 # Globals
 #-----------------------------------------------------------------------------
 
-GROUP_MASK = futil.load_image_fiac('group', 'mask.nii')
+GROUP_MASK = np.ones(shop_subj.Subject('nc').fmri.shape[:3]) # no mask
 TINY_MASK = np.zeros(GROUP_MASK.shape, np.bool)
 TINY_MASK[30:32,40:42,30:32] = 1
 
@@ -43,122 +47,35 @@ TINY_MASK[30:32,40:42,30:32] = 1
 
 # For group analysis
 
-def run_model(subj, run):
+def run_model(subj):
     """
-    Single subject fitting of FIAC model
+    Single subject fitting of SHOP model
     """
     #----------------------------------------------------------------------
     # Set initial parameters of the FIAC dataset
     #----------------------------------------------------------------------
     # Number of volumes in the fMRI data
-    nvol = 191
+    nvol = shop_util.FRAME_TIMES.shape[0]
     # The TR of the experiment
-    TR = 2.5 
+    TR = shop_util.TR
     # The time of the first volume
     Tstart = 0.0
     # The array of times corresponding to each 
     # volume in the fMRI data
-    volume_times = np.arange(nvol)*TR + Tstart
+    frame_times = shop_util.FRAME_TIMES
     # This recarray of times has one column named 't'
     # It is used in the function design.event_design
     # to create the design matrices.
-    volume_times_rec = formula.make_recarray(volume_times, 't')
-    # Get a path description dictionary that contains all the path data
-    # relevant to this subject/run
-    path_info = futil.path_info(subj,run)
 
     #----------------------------------------------------------------------
-    # Experimental design
+    # Experimental design, handled in Subject class
     #----------------------------------------------------------------------
 
-    # Load the experimental description from disk.  We have utilities in futil
-    # that reformat the original FIAC-supplied format into something where the
-    # factorial structure of the design is more explicit.  This has already
-    # been run once, and get_experiment_initial() will simply load the
-    # newly-formatted design description files (.csv) into record arrays.
-    experiment, initial = futil.get_experiment_initial(path_info)
-    
-    # Create design matrices for the "initial" and "experiment" factors,
-    # saving the default contrasts. 
-
-    # The function event_design will create
-    # design matrices, which in the case of "experiment"
-    # will have num_columns =
-    # (# levels of speaker) * (# levels of sentence) * len(delay.spectral) =
-    #      2 * 2 * 2 = 8
-    # For "initial", there will be
-    # (# levels of initial) * len([hrf.glover]) = 1 * 1 = 1
-
-    # Here, delay.spectral is a sequence of 2 symbolic HRFs that 
-    # are described in 
-    # 
-    # Liao, C.H., Worsley, K.J., Poline, J-B., Aston, J.A.D., Duncan, G.H.,
-    #    Evans, A.C. (2002). \'Estimating the delay of the response in fMRI
-    #    data.\' NeuroImage, 16:593-606.
-
-    # The contrasts, cons_exper,
-    # is a dictionary with keys: ['constant_0', 'constant_1', 'speaker_0', 
-    # 'speaker_1',
-    # 'sentence_0', 'sentence_1', 'sentence:speaker_0', 'sentence:speaker_1']
-    # representing the four default contrasts: constant, main effects + 
-    # interactions,
-    # each convolved with 2 HRFs in delay.spectral. Its values
-    # are matrices with 8 columns.
-
-    # XXX use the hrf __repr__ for naming contrasts
-
-    X_exper, cons_exper = design.event_design(experiment, volume_times_rec,
-                                              hrfs=delay.spectral)
-
-    # The contrasts for 'initial' are ignored 
-    # as they are "uninteresting" and are included
-    # in the model as confounds.
-
-    X_initial, _ = design.event_design(initial, volume_times_rec,
-                                       hrfs=[hrf.glover]) 
-
-    # In addition to factors, there is typically a "drift" term
-    # In this case, the drift is a natural cubic spline with
-    # a not at the midpoint (volume_times.mean())
-
-    vt = volume_times # shorthand
-    drift = np.array( [vt**i for i in range(4)] +
-                      [(vt-vt.mean())**3 * (np.greater(vt, vt.mean()))] )
-    for i in range(drift.shape[0]):
-        drift[i] /= drift[i].max()
-
-    # We transpose the drift so that its shape is (nvol,5) so that it will have
-    # the same number of rows as X_initial and X_exper.
-    drift = drift.T
-
-    # There are helper functions to create these drifts: design.fourier_basis,
-    # design.natural_spline.  Therefore, the above is equivalent (except for
-    # the normalization by max for numerical stability) to
-    #
-    # >>> drift = design.natural_spline(t, [volume_times.mean()])
-
-    # Stack all the designs, keeping the new contrasts which has the same keys
-    # as cons_exper, but its values are arrays with 15 columns, with the
-    # non-zero entries matching the columns of X corresponding to X_exper
-    X, cons = design.stack_designs((X_exper, cons_exper),
-                                   (X_initial, {}),
-                                   (drift, {}))
-
-    # Sanity check: delete any non-estimable contrasts
-    # XXX - this seems to be broken right now, it's producing bogus warnings.
-    ## for k in cons.keys():
-    ##     if not isestimable(X, cons[k]):
-    ##         del(cons[k])
-    ##         warnings.warn("contrast %s not estimable for this run" % k)
-
-    # The default contrasts are all t-statistics.  We may want to output
-    # F-statistics for 'speaker', 'sentence', 'speaker:sentence' based on the
-    # two coefficients, one for each HRF in delay.spectral
-
-    cons['speaker'] = np.vstack([cons['speaker_0'], cons['speaker_1']])
-    cons['sentence'] = np.vstack([cons['sentence_0'], cons['sentence_1']])
-    cons['sentence:speaker'] = np.vstack([cons['sentence:speaker_0'], 
-                                          cons['sentence:speaker_1']])
+    subject = shop_subj.Subject(subj)
+    frame_times = subject.datarec['t']
+    model_formula = subject.formula('model')
+    X, cons = model_formula.design(subject.datarec,
+                                   contrasts=subject.contrasts)
 
     #----------------------------------------------------------------------
     # Data loading
@@ -168,9 +85,7 @@ def run_model(subj, run):
     # It is transposed to have time as the first dimension,
     # i.e. fmri[t] gives the t-th volume.
 
-    fmri_lpi = futil.get_fmri(path_info) # an LPIImage
-    fmri_im = Image(fmri_lpi._data, fmri_lpi.coordmap)
-    fmri_im = image_rollaxis(fmri_im, 't')
+    fmri_im = image_rollaxis(subject.fmri, 't')
 
     fmri = fmri_im.get_data() # now, it's an ndarray
 
@@ -189,7 +104,10 @@ def run_model(subj, run):
     ar1 = np.zeros(volshape)
 
     # Fit the model, storing an estimate of an AR(1) parameter at each voxel
+
+    pbar = ProgressBar(maxval=nslice)
     for s in range(nslice):
+        pbar.update(s+1)
         d = np.array(fmri[:,s])
         flatd = d.reshape((d.shape[0], -1))
         result = m.fit(flatd)
@@ -205,121 +123,97 @@ def run_model(subj, run):
 
     ar1 *= 100
     ar1 = ar1.astype(np.int) / 100.
-
-    # We split the contrasts into F-tests and t-tests.
-    # XXX helper function should do this
-    
-    fcons = {}; tcons = {}
-    for n, v in cons.items():
-        v = np.squeeze(v)
-        if v.ndim == 1:
-            tcons[n] = v
-        else:
-            fcons[n] = v
+    ar1 = np.clip(ar1, -1, 1)
 
     # Setup a dictionary to hold all the output
     # XXX ideally these would be memmap'ed Image instances
 
     output = {}
-    for n in tcons:
+    for n in cons:
         tempdict = {}
         for v in ['sd', 't', 'effect']:
             tempdict[v] = np.memmap(NamedTemporaryFile(prefix='%s%s.nii' \
-                                    % (n,v)), dtype=np.float, 
+                                                       % (n,v)), dtype=np.float, 
                                     shape=volshape, mode='w+')
         output[n] = tempdict
     
-    for n in fcons:
-        output[n] = np.memmap(NamedTemporaryFile(prefix='%s%s.nii' \
-                                    % (n,v)), dtype=np.float, 
-                                    shape=volshape, mode='w+')
-
     # Loop over the unique values of ar1
 
     for val in np.unique(ar1):
-        armask = np.equal(ar1, val)
-        m = ARModel(X, val)
-        d = fmri[:,armask]
-        results = m.fit(d)
+        if val != -1.:
+            armask = np.equal(ar1, val)
+            m = ARModel(X, val)
+            d = fmri[:,armask]
+            results = m.fit(d)
 
-        # Output the results for each contrast
+            # Output the results for each contrast
 
-        for n in tcons:
-            resT = results.Tcontrast(tcons[n])
-            output[n]['sd'][armask] = resT.sd
-            output[n]['t'][armask] = resT.t
-            output[n]['effect'][armask] = resT.effect
-
-        for n in fcons:
-            output[n][armask] = results.Fcontrast(fcons[n]).F
+            for n in cons:
+                resT = results.Tcontrast(cons[n])
+                output[n]['sd'][armask] = resT.sd
+                output[n]['t'][armask] = resT.t
+                output[n]['effect'][armask] = resT.effect
 
     # Dump output to disk
-    odir = futil.output_dir(path_info,tcons,fcons)
+    odir = pjoin(shop_util.DATADIR, 'results', subj)
+    coordmap = drop_io_dim(fmri_im.coordmap, 't')
 
-    for n in tcons:
+    for n in cons:
+        if not pexists(pjoin(odir, n)):
+            makedirs(pjoin(odir, n))
         for v in ['t', 'sd', 'effect']:
-            lpi_im = LPIImage(output[n][v], fmri_lpi.affine,
-                              fmri_lpi.axes.coord_names[:3])
-            im = Image(lpi_im._data, lpi_im.coordmap) # This is necessary to save the results for now
+            im = Image(output[n][v], coordmap)
             save_image(im, pjoin(odir, n, '%s.nii' % v))
 
-    for n in fcons:
-        lpi_im = LPIImage(output[n], fmri_lpi.affine,
-                          fmri_lpi.axes.coord_names[:3])
-        im = Image(lpi_im._data, lpi_im.coordmap) # This is necessary to save the results for now
-        im = api.Image(output[n], affine_coordmap)
-        save_image(im, pjoin(odir, n, "F.nii"))
 
-
-def fixed_effects(subj, design):
+def fixed_effects(contrast):
     """
-    Fixed effects (within subject) for FIAC model
+    Fixed effects for SHOP data
     """
 
     # First, find all the effect and standard deviation images
     # for the subject and this design type
 
-    path_dict = futil.path_info2(subj, design)
-    rootdir = path_dict['rootdir']
-    # The output directory
-    fixdir = pjoin(rootdir, "fixed")
-
-    results = futil.results_table(path_dict)
+    subjects = glob(pjoin(shop_util.DATADIR, 'results', '*', contrast))
+    
+    fixdir = pjoin(pjoin(shop_util.DATADIR, 'fixed_results'))
+    effects = [pjoin(s, 'effect.nii') for s in subjects]
+    sds = [pjoin(s, 'sd.nii') for s in subjects]
 
     # Get our hands on the relevant coordmap to
     # save our results
-    coordmap = futil.load_image_fiac("fiac_%02d" % subj,
-                                     "wanatomical.nii").coordmap
+    coordmap = load_image(effects[0]).coordmap
 
-    # Compute the "fixed" effects for each type of contrast
-    for con in results:
-        fixed_effect = 0
-        fixed_var = 0
-        for effect, sd in results[con]:
-            effect = load_image(effect); sd = load_image(sd)
-            var = np.array(sd)**2
+    # Compute the "fixed" effects 
 
-            # The optimal, in terms of minimum variance, combination of the
-            # effects has weights 1 / var
-            #
-            # XXX regions with 0 variance are set to 0
-            # XXX do we want this or np.nan?
-            ivar = np.nan_to_num(1. / var)
-            fixed_effect += effect * ivar
-            fixed_var += ivar
+    fixed_effect = 0
+    fixed_var = 0
+    for effect, sd in zip(effects, sds):
+        effect_im = load_image(effect); sd_im = load_image(sd)
+        var = sd_im.get_data()**2
 
-        # Now, compute the fixed effects variance and t statistic
-        fixed_sd = np.sqrt(fixed_var)
-        isd = np.nan_to_num(1. / fixed_sd)
-        fixed_t = fixed_effect * isd
+        # The optimal, in terms of minimum variance, combination of the
+        # effects has weights 1 / var
+        #
+        # XXX regions with 0 variance are set to 0
+        # XXX do we want this or np.nan?
+        ivar = np.nan_to_num(1. / var)
+        fixed_effect += effect_im.get_data() * ivar
+        fixed_var += ivar
 
-        # Save the results
-        odir = futil.ensure_dir(fixdir, con)
-        for a, n in zip([fixed_effect, fixed_sd, fixed_t],
-                        ['effect', 'sd', 't']):
-            im = api.Image(a, coordmap.copy())
-            save_image(im, pjoin(odir, '%s.nii' % n))
+    # Now, compute the fixed effects variance and t statistic
+    fixed_sd = np.sqrt(fixed_var)
+    isd = np.nan_to_num(1. / fixed_sd)
+    fixed_t = fixed_effect * isd
 
+    # Save the results
+    odir = shop_util.ensure_dir(fixdir, contrast)
+    for a, n in zip([fixed_effect, fixed_sd, fixed_t],
+                    ['effect', 'sd', 't']):
+        old = coordmap.affine
+        im = Image(a, coordmap)
+        save_image(im, pjoin(odir, '%s.nii' % n))
+        
 def group_analysis(design, contrast):
     """
     Compute group analysis effect, sd and t

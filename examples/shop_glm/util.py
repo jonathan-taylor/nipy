@@ -12,10 +12,10 @@ local file management issues.
 #-----------------------------------------------------------------------------
 # Stdlib
 import os
-
 from StringIO import StringIO
 from os import makedirs, listdir
-from os.path import exists, abspath, isdir, join as pjoin
+from os.path import exists, abspath, isdir, join as pjoin, basename
+from glob import glob
 
 # Third party
 import numpy as np
@@ -32,11 +32,30 @@ from nipy.core.image.xyz_image import XYZImage
 # We assume that there is a directory holding the data and it's local to this
 # code.  Users can either keep a copy here or a symlink to the real location on
 # disk of the data.
-DATADIR = 'fiac_data'
+DATADIR = '/home/jtaylo/work/shop/subjects/allFirstPres'
+SUBJECTS = set([basename(s.split('_')[0]) for s in glob(pjoin(DATADIR, '*4mm*'))])
+
+# Global features of the fMRI design
+
+TR = 2. # 2 second TRs
+FRAME_TIMES = np.arange(564)*TR 
+TRS = csv2rec("%s/trIndex.csv" % DATADIR)['tr']
+TRIALS = csv2rec("%s/trIndex.csv" % DATADIR)['trial']
+
+# Beginning and end of blocks for PREF, BUY, PPE
+
+PREF_START = FRAME_TIMES[(TRS == 0) * (TRIALS != 0)]
+PREF_END = FRAME_TIMES[TRS == 3] + TR
+
+PPE_START = FRAME_TIMES[TRS == 2]
+PPE_END = FRAME_TIMES[TRS == 3] + TR
+
+BUY_START = FRAME_TIMES[TRS == 4]
+BUY_END = FRAME_TIMES[TRS == 5] + TR
 
 # Sanity check
 if not os.path.isdir(DATADIR):
-    e="The data directory %s must exist and contain the FIAC data." % DATADIR
+    e="The data directory %s must exist and contain the SHOP data." % DATADIR
     raise IOError(e)
 
 #-----------------------------------------------------------------------------
@@ -44,47 +63,17 @@ if not os.path.isdir(DATADIR):
 #-----------------------------------------------------------------------------
 
 # Path management utilities
-def load_image_fiac(*path):
-    """Return a NIPY image from a set of path components.
+def load_subject_shop(subject):
+    """Return a dictionary with fMRI image
+    and behavioural data from a subject identifier.
     """
-    return load_image(pjoin(DATADIR, *path))
-
-
-def subject_dirs(design, contrast, nsub=16):
-    """Return a list of subject directories.
-    """
-    rootdir = DATADIR
-    subjects = [ f for f in  [pjoin(rootdir, "fiac_%02d" % s, design, "fixed",
-                                    contrast) for s in range(nsub)]
-                 if isdir(f) ]
-    return subjects
-
-    
-def path_info(subj,run):
-    """Construct path ifnormation dict for current subject/run.
-
-    Returns
-    -------
-    path_dict : a dict with all the necessary path-related keys, including
-    'rootdir'.
-    """
-    path_dict = {'subj':subj, 'run':run}
-    if exists(pjoin(DATADIR, "fiac_%(subj)02d",
-                    "block", "initial_%(run)02d.csv") % path_dict):
-        path_dict['design'] = 'block'
+    if subject in SUBJECTS:
+        fmri = load_image("%s/%s_first4mmhpfn+tlrc.nii" % (DATADIR, subject))
+        behavior = csv2rec("%s/%s_firstBeh.csv" % (DATADIR, subject))
     else:
-        path_dict['design'] = 'event'
-    rootdir = pjoin(DATADIR, "fiac_%(subj)02d", "%(design)s") % path_dict
-    path_dict['rootdir'] = rootdir
-    return path_dict
+        raise IOError('subject "%s" not found' % str(subject))
+    return {'fmri':fmri, 'behavior':behavior}
 
-
-def path_info2(subj,design):
-    path_dict = {'subj':subj, 'design':design}
-    rootdir = pjoin(DATADIR, "fiac_%(subj)02d", "%(design)s") % path_dict
-    path_dict['rootdir'] = rootdir
-    return path_dict
-    
 
 def results_table(path_dict):
     # Which runs correspond to this design type?
@@ -108,6 +97,12 @@ def results_table(path_dict):
                                                        fname_sd])
     return results
 
+def impute(data):
+    mask = np.isnan(data)
+    mean = data[~mask].mean()
+    clean = np.array(data, copy=True)
+    clean[mask] = mean
+    return clean
 
 def get_experiment_initial(path_dict):
     """Get the record arrays for the experimental/initial designs.
